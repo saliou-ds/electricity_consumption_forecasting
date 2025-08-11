@@ -61,13 +61,14 @@ Forecast plots for both scenarios.
 
 Insights on the impact of including temperature data.
 
-##📂 Repository Structure
-
+## 📂 Repository Structure
+<pre> ```
 ├── data.xlsx           # Input datasets
 ├── script.rmd          # R scripts for preprocessing, training, evaluation
 ├── results.xlsx        # Forecast outputs 
 ├── README.md
-
+``` </pre>
+  
 🚀 Future Improvements
 Incorporating additional weather variables.
 
