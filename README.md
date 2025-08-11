@@ -77,6 +77,6 @@ Testing hybrid models (e.g., ARIMA + Neural Networks).
 Extending forecasting horizon beyond 1 day.
 
 📧 Contact
+
 **Saliou Cisse** – Data Scientist  
-🌐 [[LinkedIn](https://www.linkedin.com/in/saliou-cisse-9b9935141/) / [GitHub](https://github.com/saliou-ds)] Cisse – Data Scientist
-🌐 [LinkedIn / GitHub]
+🌐 [[LinkedIn](https://www.linkedin.com/in/saliou-cisse-9b9935141/) / [GitHub](https://github.com/saliou-ds)] 
