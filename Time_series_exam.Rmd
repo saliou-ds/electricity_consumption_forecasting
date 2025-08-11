@@ -1,0 +1,406 @@
+---
+title: "Time Series"
+output:
+  pdf_document: 
+    latex_engine: xelatex
+date: "2025-08-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(error = TRUE)  # let knitting continue even if a chunk fails
+```
+
+# Electricity Consumption Forecasting
+
+## Load Data
+
+```{r}
+library(readxl)
+path <- "Time_series_2025-06-Elec-train_fad91f5c2e247ef8ec2a2bde21d97e31.xlsx"
+
+data <- read_excel(path, col_types = c("text", "numeric", "numeric") )
+data [1,1] <- "1/1/2010 1:15"
+data$Timestamp <- as.POSIXct(data$Timestamp, format = "%m/%d/%Y %H:%M")
+print(data)
+```
+
+Verify if there's no missing values beside the one we want to predict
+
+```{r}
+summary(data)
+```
+
+Sorting of the table by timestamp
+
+```{r}
+data <- data[order(data$Timestamp), ]
+```
+
+```{r}
+# Time differences between consecutive observations
+diffs <- diff(data$Timestamp)
+
+# Count differences in minutes
+cat("Time difference between consecutive obs followed by how many time it occurs :")
+table(as.numeric(diffs, units = "mins"))
+```
+
+## EDA
+
+```{r}
+library(ggplot2)
+
+ggplot(subset(data, Timestamp < as.POSIXct("2010-02-21")), aes(x = Timestamp, y = `Power (kW)`)) + 
+  geom_line(color = "steelblue") + 
+  labs(title = "Electricity Consomption Over Time",
+       x = "Time",
+       y = "Power Consumption (kW)") +
+  theme_minimal()
+
+```
+
+It’s showing strong daily cycles, fairly stable from mid-January to mid-February, plus a couple of visible anomalies: - Big drop to zero around mid-February (likely missing or faulty data). - Spikes early January and mid-February.
+
+Trend : Flat over the period Seasonality : Daily cycle Residuals (outliers) : The spikes identified
+
+```{r}
+ggplot(
+  subset(data, Timestamp >= as.POSIXct("2010-02-14") &
+                Timestamp <= as.POSIXct("2010-02-19")),
+  aes(x = Timestamp, y = `Power (kW)`)
+) +
+  geom_line(color = "red") +
+  labs(title = "Zoom on Mid-February Drop",
+       x = "Time",
+       y = "Power Consumption (kW)") +
+  theme_minimal()
+```
+
+We see a sudden drop to zero followed by an immediate return to normal, that’s probably faulty data and not a real trend
+
+```{r}
+library(dplyr)
+library(zoo) # for rollmedian
+
+# Rolling median (same time scale as your data: 15-min)
+roll_med <- rollmedian(data$`Power (kW)`, k = 96, fill = NA) # 96 = 1 day
+
+# Flag anomalies: deviation > 2× Median Absolute Deviation
+## The multiplier “×3” comes from the empirical rule for normal distributions that says that In a perfect bell curve, ~99.7% of data lies within ±3 standard deviations from the mean.MAD can be scaled to act like standard deviation so 
+mad_val <- mad(data$`Power (kW)`, na.rm = TRUE)
+data <- data %>%
+  mutate(
+    is_outlier = abs(`Power (kW)` - roll_med) > 2 * mad_val,
+    is_outlier = ifelse(is.na(is_outlier), FALSE, is_outlier)
+    )
+
+# Plot with anomalies in red
+ggplot(subset(data, Timestamp < as.POSIXct("2010-02-21")), aes(x = Timestamp, y = `Power (kW)`)) +
+  geom_line(color = "steelblue") +
+  geom_point(data = subset(data, is_outlier),
+             aes(x = Timestamp, y = `Power (kW)`),
+             color = "red", size = 2) +
+  labs(title = "Electricity Consumption with Outliers Highlighted",
+       x = "Time", y = "Power (kW)") +
+  theme_minimal()
+```
+
+```{r}
+ggplot(subset(data, Timestamp >= as.POSIXct("2010-02-14") &
+                Timestamp <= as.POSIXct("2010-02-19")), aes(x = Timestamp, y = `Power (kW)`)) +
+  geom_line(color = "steelblue") +
+  geom_point(data = subset(data, is_outlier),
+             aes(x = Timestamp, y = `Power (kW)`),
+             color = "red", size = 2) +
+  labs(title = "Electricity Consumption with Outliers Highlighted",
+       x = "Time", y = "Power (kW)") +
+  theme_minimal()
+
+```
+
+```{r}
+data <- data %>%
+  mutate(TimeOfDay = format(Timestamp, "%H:%M")) %>%
+  group_by(TimeOfDay) %>%
+  mutate(`Power (kW)` = ifelse(is_outlier,
+                               mean(`Power (kW)`[!is_outlier], na.rm = TRUE),
+                               `Power (kW)`)) %>%
+  ungroup() %>%
+  select(-TimeOfDay, -is_outlier)
+
+
+ggplot(subset(data, Timestamp < as.POSIXct("2010-02-21")), aes(x = Timestamp, y = `Power (kW)`)) +
+  geom_line(color = "steelblue") +
+  labs(title = "Electricity Consumption After Seasonal Average Replacement",
+       x = "Time", y = "Power (kW)") +
+  theme_minimal()
+```
+
+Sorting of the table by timestamp (double verification, after the changes made)
+
+```{r}
+data <- data[order(data$Timestamp), ]
+```
+
+Split Dataset (Train, Validation, Test)
+
+```{r}
+train_df  <- dplyr::filter(data, Timestamp <  as.POSIXct("2010-02-21 00:00:00"))
+future_df <- dplyr::filter(data, Timestamp >= as.POSIXct("2010-02-21 00:00:00"),
+                                  Timestamp <= as.POSIXct("2010-02-21 23:45:00"))
+
+y_train <- ts(train_df$`Power (kW)`, frequency=96)
+temp_train<- train_df$`Temp (C°)`
+temp_test <- future_df$`Temp (C°)`
+
+
+# Validation split on the last week
+
+m <- 96 # number of observation in a seasonal cycle
+h_day <- 96 # 15 minutes split a day
+h_val <- 7*m # number of observation in the validation week
+y_fit   <- head(y_train, length(y_train)-h_val)
+y_valid <- tail(y_train, h_val)
+x_fit   <- head(temp_train, length(temp_train)-h_val)
+x_valid <- tail(temp_train, h_val)
+
+cat("Train : \n")
+cat("min : ")
+min(train_df$Timestamp); 
+cat("max : ")
+max(train_df$Timestamp)
+cat("\nTest : \n")
+cat("min : ")
+min(future_df$Timestamp);  
+cat("max : ")
+max(future_df$Timestamp)
+
+```
+
+## ETS (Error, Trend, Seasonality) Models & AR/MA/ARMA/ARIMA/SARIMA - without using covariable (temperature)
+
+### Training & Validation
+
+Training
+
+```{r}
+library(forecast)
+
+# We're going to seasonal naïve forecast to have a benchmark/baseline
+fc_snaive <- snaive(y_fit, h = m)
+
+models_no_X <- list(
+  # ETS 
+  SES = ets(y_fit, model = "ANN"),
+  Holt = ets(y_fit, model = "AAN"),
+  Damped = ets(y_fit, model = "AAN", damped = TRUE),
+  HWadd = HoltWinters(y_fit, seasonal='additive'), # not ets because frequency too high (=96)
+  HWmul = HoltWinters(y_fit, seasonal='multiplicative'), # not ets because frequency too high (=96),
+  
+  # (Seasonal) (autoregressive) (integrated) (moving average)
+  AR = auto.arima(y_fit, max.p=10, max.q=0, d=0, seasonal=FALSE, stepwise=TRUE, approximation=TRUE),
+  MA = auto.arima(y_fit, max.p=0, max.q=10, d=0, seasonal=FALSE, stepwise=TRUE, approximation=TRUE),
+  ARMA = auto.arima(y_fit, d=0, seasonal=FALSE, stepwise=FALSE, approximation=TRUE),
+  ARIMA = auto.arima(y_fit, seasonal=FALSE, stepwise=FALSE, approximation=FALSE),
+  SARIMA = auto.arima(y_fit, seasonal=TRUE, stepwise=TRUE, approximation=TRUE) # 
+)
+
+```
+
+Evaluation
+
+```{r}
+cat("Seasonal Naive accuracy (RMSE) : \n ", 
+  accuracy(fc_snaive$mean, y_valid)["Test set", "RMSE"]
+);
+
+scores_no_X <- sapply(models_no_X, function(x) {
+  pred <- forecast(x, h = h_val)$mean
+  accuracy(pred, y_valid)["Test set", "RMSE"]
+  }
+)
+
+best_score_no_X <- names(scores_no_X)[which.min(scores_no_X)] # RMSE: Root Mean Squared Error 
+cat(
+  "\n\nPredictive accuracy (RMSE) : \n")
+  scores_no_X
+  cat("\n\nAnd the best model is : \n",
+  best_score_no_X
+)
+
+```
+
+Obviously the models that take into account daily seasonality perform better, we already observed strong seasonality earlier in the EDA. The Holt-Winters additive model (HWadd) gives the best RMSE (≈ 16.85), followed closely by the multiplicative version (HWmul). Both clearly outperform the non-seasonal models like SES, Holt, or AR/MA/ARMA.
+
+### Training on full data & Prediction
+
+```{r}
+# Refit best model on all training data
+final_HWadd <- HoltWinters(y_train, seasonal = "additive")
+
+# Forecast for the test day (96 time steps)
+fc_HWadd <- forecast(final_HWadd, h = m)  # m = 96
+
+
+```
+
+Plot
+
+```{r}
+
+# Create a dataframe for plotting
+plot_df <- data.frame(
+  Timestamp = seq(
+    from = max(train_df$Timestamp) + (15*60),
+    by   = "15 min",
+    length.out = m
+  ),
+  Forecast = as.numeric(fc_HWadd$mean)
+)
+plot_df
+ggplot(plot_df, aes(x = Timestamp)) +
+  geom_line(aes(y = Forecast), color = "red", linetype = "dashed", size = 1) +
+  labs(
+    title = "Holt-Winters Additive Forecast (Test Day)",
+    x = "Time",
+    y = "Power Consumption (kW)"
+  ) +
+  theme_minimal() +
+  scale_x_datetime(date_labels = "%H:%M")
+```
+Using only historical electricity consumption, the selected model captures the strong daily seasonality (period = 96 for 15-minute data) and the stable weekly pattern observed in the training period.
+
+Validation performance: On a 1-day holdout, the chosen seasonal model (Holt-Winters additive) produced a low RMSE of 16.85363 and outperformed more complex alternatives such as SARIMA without alternative variables.
+
+Behavior(plot): The forecast for 2010-02-21 closely follows the shape of the previous day/week, reflecting the repetitive load profile of the building when external influences are not considered.
+
+Implication: Even without temperature, seasonal patterns alone explain a large share of short-term variability in electricity demand, making simple seasonal models a competitive baseline.
+
+## Time Series prediction with Covariate
+
+### Training & Validation
+
+Training
+
+```{r}
+# ARIMAX (dynamic regression with temperature as covariate)
+
+fit_ARIMAX_eva <- auto.arima(
+  y_fit,
+  xreg = x_fit,
+  seasonal = TRUE,
+  stepwise = TRUE,
+  approximation = TRUE
+)
+
+fc_ARIMAX_eva <- forecast(
+  fit_ARIMAX_eva,
+  xreg = x_valid,
+  h = m
+)
+```
+
+Evaluation
+
+```{r}
+cat("Seasonal Naive accuracy (RMSE) : \n ", 
+  accuracy(fc_snaive_covariate$mean, y_valid)["Test set", "RMSE"]
+);
+
+cat("\n\nPrediction accuracy (RMSE) : \n",
+    accuracy(fc_ARIMAX_eva$mean, y_valid)["Test set", "RMSE"]
+  )
+```
+
+### Training on full data & Prediction
+
+```{r}
+fit_ARIMAX <- auto.arima(
+  y_train,
+  xreg = temp_train,
+  seasonal = TRUE,
+  stepwise = TRUE,
+  approximation = TRUE
+)
+
+fc_ARIMAX <- forecast(
+  fit_ARIMAX,
+  xreg = temp_test,
+  h = m
+)
+
+```
+
+Plot
+
+```{r}
+
+# Create a dataframe for plotting
+plot_df_covariate <- data.frame(
+  Timestamp = seq(
+    from = max(train_df$Timestamp) + (15*60),
+    by   = "15 min",
+    length.out = m
+  ),
+  Forecast = as.numeric(fc_ARIMAX$mean)
+)
+plot_df_covariate
+ggplot(plot_df_covariate, aes(x = Timestamp)) +
+  geom_line(aes(y = Forecast), color = "red", linetype = "dashed", size = 1) +
+  labs(
+    title = "ARIMAX Forecast (Test Day)",
+    x = "Time",
+    y = "Power Consumption (kW)"
+  ) +
+  theme_minimal() +
+  scale_x_datetime(date_labels = "%H:%M")
+```
+
+Incorporating outdoor temperature into an ARIMAX model yielded an RMSE of 18.85, better than SARIMA (19.08) but worse than Holt-Winters additive.
+
+Why performance was lower: While temperature is intuitively related to energy demand (especially heating), in this dataset the seasonal signal is so dominant that temperature’s added explanatory power is limited for short-term (1-day) prediction. The inclusion of temperature may also have introduced additional noise, slightly degrading accuracy compared to the purely seasonal model.
+
+Forecast pattern: The ARIMAX forecasts still track daily patterns but adjust them modestly based on the forecast day’s temperature profile. However, these adjustments did not translate into improved error metrics.
+
+
+## Conclusion 
+
+### Comparison & Implications
+
+Holt-Winters additive remains the most accurate choice for this specific task, outperforming both ARIMAX and SARIMA for the 1-day horizon.
+
+ARIMAX shows that adding temperature can model weather-related deviations, but in this case, those deviations were not strong enough to outweigh the predictive strength of the pure seasonal pattern.
+
+For operational forecasting, this suggests prioritizing robust seasonal models when patterns are stable, and considering exogenous variables mainly when large weather-driven variations are expected.
+
+
+### Export prediction (xlsx) & report (html -> pdf)
+
+Combine both forecasts
+
+```{r}
+pred_df <- data.frame(
+  HWadd_Pred_kW  = as.numeric(fc_HWadd$mean),
+  ARIMAX_Pred_kW = as.numeric(fc_ARIMAX$mean)
+)
+```
+
+Export
+
+```{r}
+library(writexl)
+
+rmarkdown::render(
+    input = "C:/Users/mon pc/Desktop/DSTI classes/Time series analysis/exam/Time_series_exam.Rmd",      
+    output_format = "html_document", 
+    output_file = "Time_series_exam.html",  
+    output_dir = ".",                # output folder (current one here)
+    clean = TRUE                     
+)
+
+write_xlsx(pred_df, "SaliouCisse.xlsx", col_names = FALSE)
+
+# Preview in the console
+head(pred_df)
+```
